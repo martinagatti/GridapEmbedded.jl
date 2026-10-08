@@ -16,9 +16,18 @@ using Gridap.Arrays: collect1d, CompressedArray, Table
 using Gridap.Adaptivity
 using Gridap.Fields: testitem
 using Gridap.CellData
-using Gridap.CellData: GenericCellField, get_data
+using Gridap.CellData: GenericField, GenericCellField, get_data
 using Gridap.CellData: _point_to_cell_cache, _point_to_cell!
 using Gridap.Geometry
+
+using PartitionedArrays
+using GridapDistributed
+using GridapDistributed: DistributedDiscreteModel
+using GridapDistributed: DistributedTriangulation
+using GridapDistributed: DistributedMeasure
+using GridapDistributed: DistributedCellField
+using GridapDistributed: add_ghost_cells
+import GridapDistributed: local_views
 
 using GridapEmbedded.Interfaces
 using GridapEmbedded.Interfaces: Simplex
@@ -32,6 +41,7 @@ import Algoim: AlgoimCallLevelSetFunction
 import Algoim: normal
 import Gridap.ReferenceFEs: Quadrature
 
+export CellQuadratureAndActiveMask
 export TriangulationAndMeasure
 export algoim
 export Quadrature
@@ -73,13 +83,38 @@ function AlgoimCallLevelSetFunction(φ::CellField,∇φ::CellField)
   AlgoimCallLevelSetFunction{typeof(φ),typeof(∇φ),typeof(cache_φ),typeof(cache_∇φ)}(φ,∇φ,cache_φ,cache_∇φ)
 end
 
+struct DistributedAlgoimCallLevelSetFunction{A<:AbstractArray{<:AlgoimCallLevelSetFunction}} <: GridapType
+  values   ::DistributedCellField
+  gradients::DistributedCellField
+  levelsets::A
+end
+
+local_views(a::DistributedAlgoimCallLevelSetFunction) = a.levelsets
+
+function AlgoimCallLevelSetFunction(φ::DistributedCellField,∇φ::DistributedCellField)
+  levelsets = map((v,g)->AlgoimCallLevelSetFunction(v,g),local_views(φ),local_views(∇φ))
+  DistributedAlgoimCallLevelSetFunction(φ,∇φ,levelsets)
+end
+
 function normal(phi::AlgoimCallLevelSetFunction,x::AbstractVector{<:Point},cell_id::Int=1)
   map(xi->normal(phi,xi,cell_id),x)
 end
 
 function normal(phi::AlgoimCallLevelSetFunction,trian::Triangulation)
   f = [ x -> normal(phi,x,i) for i in 1:num_cells(trian) ]
+  f = map(GenericField,f)
   GenericCellField(f,trian,PhysicalDomain())
+end
+
+function normal(phi::AlgoimCallLevelSetFunction,trian::DistributedTriangulation)
+  normals = map(t->normal(phi,t),local_views(trian))
+  DistributedCellField(normals,trian)
+end
+
+function normal(phi::DistributedAlgoimCallLevelSetFunction,_trian::DistributedTriangulation)
+  trian = add_ghost_cells(_trian)
+  normals = map((φ,t)->normal(φ,t),local_views(phi),local_views(trian))
+  DistributedCellField(normals,trian)
 end
 
 function normal(ls::AlgoimCallLevelSetFunction{<:CellField,<:CellField},x::Point,cell_id::Int=1)
@@ -96,6 +131,21 @@ function Quadrature(trian::Grid,::Algoim,phi::LevelSetFunction,degree::Int;kwarg
   jls = JuliaFunctionLevelSet(phi,Val{num_dims(trian)}())
   cell_to_quad = map(enumerate(cell_to_bboxes)) do (cell_id,bbox)
     bbmin, bbmax = bbox
+    Quadrature(cell_id,bbmin,bbmax,jls,phi,degree;kwargs...)
+  end
+  CompressedArray(cell_to_quad,1:length(cell_to_quad))
+end
+
+function Quadrature(trian::Grid,::Algoim,phi::LevelSetFunction,
+                    own_to_local::AbstractVector,degree::Int;kwargs...)
+  ctype_polytope = map(get_polytope,get_reffes(trian))
+  @notimplementedif !all(map(is_n_cube,ctype_polytope))
+  cell_to_coords = get_cell_coordinates(trian)
+  cell_to_bboxes = collect1d(lazy_map(a->(a[1],a[end]),cell_to_coords))
+  jls = JuliaFunctionLevelSet(phi,Val{num_dims(trian)}())
+  cell_to_quad = map(enumerate(cell_to_bboxes)) do (own_cell_id,bbox)
+    bbmin, bbmax = bbox
+    cell_id = own_to_local[own_cell_id]
     Quadrature(cell_id,bbmin,bbmax,jls,phi,degree;kwargs...)
   end
   CompressedArray(cell_to_quad,1:length(cell_to_quad))
@@ -143,9 +193,80 @@ function Quadrature(cell_id::Int,
   GenericQuadrature(coords,weights,"Algoim quadrature of degree $degree")
 end
 
-function is_cell_active(meas::Measure)
+function is_cell_active(cell_quad::AbstractArray{<:Quadrature})
   has_non_empty_quad(x) = num_points(x) > 0
-  lazy_map(has_non_empty_quad,get_data(meas.quad))
+  lazy_map(has_non_empty_quad,cell_quad)
+end
+
+function is_cell_active(meas::Measure)
+  is_cell_active(get_data(meas.quad))
+end
+
+function is_cell_active(meas::DistributedMeasure)
+  map(local_views(meas)) do meas
+    is_cell_active(get_data(meas.quad))
+  end
+end
+
+# Splits the (possibly expensive) construction of the per-cell Algoim
+# quadrature from the active-cell mask, so that both can be reused later
+# (e.g. to build an aggregated model and only then the triangulation/measure)
+# instead of recomputing the quadrature from scratch.
+function _cell_quadrature_and_active_mask(trian::Grid,
+                                          ::Algoim,phi,args;kwargs)
+  cell_quad = Quadrature(trian,algoim,phi,args...;kwargs...)
+  cell_to_is_active = is_cell_active(cell_quad)
+  cell_quad, cell_to_is_active
+end
+
+function _cell_quadrature_and_active_mask(trian::DistributedTriangulation,
+    ::Algoim,
+    phi::AlgoimCallLevelSetFunction,
+    args;kwargs)
+  ltrians = local_views(trian)
+  cell_quad = map(t->Quadrature(t,algoim,phi,args...;kwargs...),ltrians)
+  cell_to_is_active = map(cq->is_cell_active(cq),cell_quad)
+  cell_quad, cell_to_is_active
+end
+
+function _cell_quadrature_and_active_mask(trian::DistributedTriangulation,
+    ::Algoim,
+    phi::DistributedAlgoimCallLevelSetFunction,
+    args;kwargs)
+  ltrians = local_views(trian); lphis = local_views(phi)
+  phitrian = get_triangulation(phi.values)
+  gids = get_cell_gids(get_background_model(phitrian))
+  own_to_local = map(local_views(phitrian),local_views(gids)) do t,g
+    findall(!iszero,local_to_own(g)[t.tface_to_mface])
+  end
+  cell_quad = map(
+    (t,p,otl)->Quadrature(t,algoim,p,otl,args...;kwargs...),ltrians,lphis,own_to_local)
+  cell_to_is_active = map(cq->is_cell_active(cq),cell_quad)
+  cell_quad, cell_to_is_active
+end
+
+function _cell_quadrature_and_active_mask(trian,
+    name,_args::Tuple{<:AlgoimCallLevelSetFunction,Any};kwargs)
+  phi, args = _args
+  _cell_quadrature_and_active_mask(trian,name,phi,args;kwargs)
+end
+
+function _cell_quadrature_and_active_mask(trian,
+    name,_args::Tuple{<:DistributedAlgoimCallLevelSetFunction,Any};kwargs)
+  phi, args = _args
+  _cell_quadrature_and_active_mask(trian,name,phi,args;kwargs)
+end
+
+function CellQuadratureAndActiveMask(trian,
+    quad::Tuple{<:QuadratureName,Any,Any})
+  name, args, kwargs = quad
+  _cell_quadrature_and_active_mask(trian,name,args;kwargs)
+end
+
+function CellQuadratureAndActiveMask(
+    model::Union{DiscreteModel,DistributedDiscreteModel},
+    quad::Tuple{<:QuadratureName,Any,Any})
+  CellQuadratureAndActiveMask(Triangulation(model),quad)
 end
 
 function restrict_measure(meas::Measure,trian::Triangulation)
@@ -158,19 +279,100 @@ function restrict_measure(meas::Measure,trian::Triangulation)
   Measure(CellQuadrature(cell_quad,cell_point,cell_weight,trian,dds,ids))
 end
 
-function TriangulationAndMeasure(Ωbg::Triangulation,quad::Tuple)
-  msg = "TriangulationAndMeasure can only receive the background triangulation"
-  @notimplementedif num_cells(get_background_model(Ωbg)) != num_cells(Ωbg) msg
+function restrict_measure(meas::Measure,trian::Triangulation,gids::AbstractLocalIndices)
+  oquad = meas.quad
+  tface_to_own_mface = local_to_own(gids)[trian.tface_to_mface]
+  cell_quad   = lazy_map(Reindex(oquad.cell_quad),tface_to_own_mface)
+  cell_point  = lazy_map(Reindex(oquad.cell_point),tface_to_own_mface)
+  cell_weight = lazy_map(Reindex(oquad.cell_weight),tface_to_own_mface)
+  dds = oquad.data_domain_style
+  ids = oquad.integration_domain_style
+  Measure(CellQuadrature(cell_quad,cell_point,cell_weight,trian,dds,ids))
+end
+
+function restrict_measure(meas::DistributedMeasure,trian::DistributedTriangulation)
+  gids = local_views(get_cell_gids(get_background_model(trian)))
+  DistributedMeasure(map(restrict_measure,local_views(meas),local_views(trian),gids),trian)
+end
+
+@inline _measure(Ωbg,quad,phi::AlgoimCallLevelSetFunction) =
+  map(lt->Measure(lt,quad,data_domain_style=PhysicalDomain()),local_views(Ωbg))
+
+@inline function _measure(Ωbg,quad,phi::DistributedAlgoimCallLevelSetFunction)
+  name, _args, kwargs = quad
+  _, args = _args
+  ltrians = local_views(Ωbg); lphis = local_views(phi)
+  map((lt,lp)->Measure(lt,(name,(lp,args),kwargs),data_domain_style=PhysicalDomain()),ltrians,lphis)
+end
+
+function _triangulation_and_measure(Ωbg::Triangulation,quad::Tuple)
   dΩbg = Measure(Ωbg,quad,data_domain_style=PhysicalDomain())
-  # RMK: This is a hack, but algoim interface does not let you 
-  # know if a (given) cell intersects the interior of the level 
-  # set. The hack consists in inferring this from the size of 
-  # each quadrature. I do not expect this hack implies a lot of 
+  # RMK: This is a hack, but algoim interface does not let you
+  # know if a (given) cell intersects the interior of the level
+  # set. The hack consists in inferring this from the size of
+  # each quadrature. I do not expect this hack implies a lot of
   # extra operations with regards to the proper way to do it.
   cell_to_is_active = is_cell_active(dΩbg)
   Ωᵃ = Triangulation(Ωbg,cell_to_is_active)
   dΩᵃ = restrict_measure(dΩbg,Ωᵃ)
   Ωᵃ,dΩᵃ,cell_to_is_active
+end
+
+function _triangulation_and_measure(Ωbg::DistributedTriangulation,quad::Tuple)
+  name, _args, kwargs = quad
+  phi, args = _args
+  ltrians = local_views(Ωbg)
+  dΩbg = _measure(Ωbg,(name,args,kwargs),phi)
+  cell_to_is_active = map(lm->is_cell_active(lm),dΩbg)
+  gids = local_views(get_cell_gids(get_background_model(Ωbg)))
+  Ωᵃ = map((lt,ca)->Triangulation(lt,ca),ltrians,cell_to_is_active)
+  dΩᵃ = map((db,at,gs)->restrict_measure(db,at,gs),dΩbg,Ωᵃ,gids)
+  Mbg = get_background_model(Ωbg)
+  DΩᵃ = DistributedTriangulation(Ωᵃ,Mbg)
+  DΩᵃ,DistributedMeasure(dΩᵃ,DΩᵃ),cell_to_is_active
+end
+
+function _triangulation_and_measure(Ωbg::Triangulation,
+                cell_quad::AbstractArray{<:Quadrature},
+                cell_to_is_active::AbstractArray{Bool},
+                cell_to_has_non_empty_quad::AbstractArray{Bool})
+  dds = PhysicalDomain(); ids = PhysicalDomain()
+  dΩbg = Measure(Ωbg,cell_quad,dds,ids)
+  Ωᵃ = Triangulation(Ωbg,cell_to_is_active)
+  dΩᵃ = restrict_measure(dΩbg,Triangulation(Ωbg,cell_to_has_non_empty_quad))
+  Ωᵃ,dΩᵃ,cell_to_is_active
+end
+
+function _triangulation_and_measure(Ωbg::DistributedTriangulation,
+                           cell_quad::AbstractArray,
+                           cell_to_is_active::AbstractArray,
+                           cell_to_has_non_empty_quad::AbstractArray)
+  ltrians = local_views(Ωbg)
+  dds = PhysicalDomain(); ids = PhysicalDomain()
+  dΩbg = map((lt,cq)->Measure(lt,cq,dds,ids),ltrians,cell_quad)
+  gids = local_views(get_cell_gids(get_background_model(Ωbg)))
+  Ωᵃ = map((lt,ca)->Triangulation(lt,ca),ltrians,cell_to_is_active)
+  Ωᵖ = map((lt,cp)->Triangulation(lt,cp),ltrians,cell_to_has_non_empty_quad)
+  dΩᵃ = map((db,at,gs)->restrict_measure(db,at,gs),dΩbg,Ωᵖ,gids)
+  Mbg = get_background_model(Ωbg)
+  DΩᵃ = DistributedTriangulation(Ωᵃ,Mbg)
+  DΩᵃ,DistributedMeasure(dΩᵃ,DΩᵃ),cell_to_is_active
+end
+
+function TriangulationAndMeasure(Ωbg,quad::Tuple)
+  msg = "TriangulationAndMeasure can only receive the background triangulation"
+  @notimplementedif num_cells(get_background_model(Ωbg)) != num_cells(Ωbg) msg
+  _triangulation_and_measure(Ωbg,quad)
+end
+
+function TriangulationAndMeasure(Ωbg,cell_quad,cell_to_is_active,
+      cell_to_has_non_empty_quad=cell_to_is_active)
+  msg = "TriangulationAndMeasure can only receive the background triangulation"
+  @notimplementedif num_cells(get_background_model(Ωbg)) != num_cells(Ωbg) msg
+  _triangulation_and_measure(Ωbg,
+                             cell_quad,
+                             cell_to_is_active,
+                             cell_to_has_non_empty_quad)
 end
 
 using Gridap.Geometry: get_cell_to_parent_cell

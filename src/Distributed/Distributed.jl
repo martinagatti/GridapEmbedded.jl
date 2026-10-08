@@ -82,6 +82,8 @@ include("DistributedSubFacetTriangulations.jl")
 
 include("DistributedAgFEM.jl")
 
+include("DistributedAgFEMNonConforming.jl")
+
 include("DistributedQuadratures.jl")
 
 include("GeometricalDerivatives.jl")

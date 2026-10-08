@@ -367,7 +367,8 @@ end
 
 # Specialised methods for Algoim quadratures
 
-function aggregate(bgtrian,cell_to_is_active,cell_to_is_cut,in_or_out)
+function aggregate(bgtrian,cell_to_is_active,cell_to_is_cut,in_or_out;
+                   grid_topology=nothing,lid_to_gid=nothing)
   n_cells = length(cell_to_is_active)
   @assert n_cells == length(cell_to_is_cut)
 
@@ -381,23 +382,24 @@ function aggregate(bgtrian,cell_to_is_active,cell_to_is_cut,in_or_out)
 
   cell_to_coords = get_cell_coordinates(bgtrian)
   model = get_background_model(bgtrian)
-  topo = get_grid_topology(model)
+  topo = grid_topology === nothing ? get_grid_topology(model) : grid_topology
   D = num_cell_dims(model)
   cell_to_faces = get_faces(topo,D,D-1)
   face_to_cells = get_faces(topo,D-1,D)
   # A hack follows to avoid constructing the actual facet_to_inoutcut array
-  facet_to_inoutcut = fill(in_or_out,num_faces(model,D-1)) 
+  facet_to_inoutcut = fill(in_or_out,num_faces(model,D-1))
 
   threshold = 1.0
-  lid_to_gid = 1:num_cells(model)
+  _lid_to_gid = lid_to_gid === nothing ? (1:num_cells(model)) : lid_to_gid
   cell_to_cellin,_,all_aggregated = _aggregate_by_threshold_barrier(
     threshold,cell_to_unit_cut_meas,facet_to_inoutcut,cell_to_inoutcut,
-    in_or_out,cell_to_coords,cell_to_faces,face_to_cells,lid_to_gid)
+    in_or_out,cell_to_coords,cell_to_faces,face_to_cells,_lid_to_gid)
   @assert all_aggregated "Not all cells were aggregated"
   cell_to_cellin
 end
 
-function aggregate_narrow_band(bgtrian,cell_to_is_in_narrow,cell_to_is_active,cell_to_is_cut,in_or_out)
+function aggregate_narrow_band(bgtrian,cell_to_is_in_narrow,cell_to_is_active,cell_to_is_cut,in_or_out;
+                               grid_topology=nothing,lid_to_gid=nothing)
   n_cells = length(cell_to_is_in_narrow)
   @assert n_cells == length(cell_to_is_active)
   @assert n_cells == length(cell_to_is_cut)
@@ -412,18 +414,18 @@ function aggregate_narrow_band(bgtrian,cell_to_is_in_narrow,cell_to_is_active,ce
 
   cell_to_coords = get_cell_coordinates(bgtrian)
   model = get_background_model(bgtrian)
-  topo = get_grid_topology(model)
+  topo = grid_topology === nothing ? get_grid_topology(model) : grid_topology
   D = num_cell_dims(model)
   cell_to_faces = get_faces(topo,D,D-1)
   face_to_cells = get_faces(topo,D-1,D)
   # A hack follows to avoid constructing the actual facet_to_inoutcut array
-  facet_to_inoutcut = fill(in_or_out,num_faces(model,D-1)) 
+  facet_to_inoutcut = fill(in_or_out,num_faces(model,D-1))
 
   threshold = 1.0
-  lid_to_gid = 1:num_cells(model)
+  _lid_to_gid = lid_to_gid === nothing ? (1:num_cells(model)) : lid_to_gid
   cell_to_cellin,_,all_aggregated = _aggregate_by_threshold_barrier(
     threshold,cell_to_unit_cut_meas,facet_to_inoutcut,cell_to_inoutcut,
-    in_or_out,cell_to_coords,cell_to_faces,face_to_cells,lid_to_gid)
+    in_or_out,cell_to_coords,cell_to_faces,face_to_cells,_lid_to_gid)
   @assert all_aggregated "Not all cells were aggregated"
   cell_to_cellin
 end

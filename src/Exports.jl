@@ -53,7 +53,9 @@ end
 @publish AlgoimUtils algoim
 @publish AlgoimUtils fill_quad_data
 @publish AlgoimUtils AlgoimCallLevelSetFunction
+@publish AlgoimUtils CellQuadratureAndActiveMask
 @publish AlgoimUtils TriangulationAndMeasure
+@publish AlgoimUtils is_cell_active
 @publish AlgoimUtils normal
 @publish AlgoimUtils fill_cpp_data
 @publish AlgoimUtils compute_closest_point_projections
