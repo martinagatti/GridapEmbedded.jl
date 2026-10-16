@@ -728,15 +728,19 @@ function compute_normal_displacement!(
     cpₕ::FEFunction,
     phi::AlgoimCallLevelSetFunction,
     dt::Float64,
-    Ω::Triangulation)
+    Ω::Triangulation;
+    searchmethod=KDTreeSearch())
   # Note that cps must be (scalar) DoF-numbered, not lexicographic-numbered
+  # searchmethod: point location of the closest points in Ω (used only when cache === nothing);
+  # on an octree pass KDTreeSearch(vertex_to_cells=...) built from the non-conforming topology.
   if isnothing(cache)
-    searchmethod = KDTreeSearch()
     cache = _point_to_cell_cache(searchmethod,Ω)
   end
   x_to_cell(x) = _point_to_cell!(cache, x)
   cps = map(Point,eachcol(reshape(get_free_dof_values(cpₕ),num_dims(Ω),:)))
-  point_to_cell = lazy_map(x_to_cell, cps)
+  # Locate each point once (a lazy array would be re-evaluated many times by the sort inside
+  # make_inverse_table, repeating the KD-tree search and inverse-map solve per access).
+  point_to_cell = collect(map(x_to_cell, cps))
   cell_to_points, _ = make_inverse_table(point_to_cell, num_cells(Ω))
   cell_to_xs = lazy_map(Broadcasting(Reindex(cps)), cell_to_points)
   cell_point_xs = CellPoint(cell_to_xs, Ω, PhysicalDomain())
@@ -755,6 +759,35 @@ function compute_normal_displacement!(
     end
   end
   disps, cache
+end
+
+# Octree normal displacement, d_i = dt (u⋅n)(c_i) at the free dofs of φ's scalar space, 1 rank.
+# - Ω: the background triangulation of the octree model. The closest points c_i are located in it
+#   with the non-conforming vertex→cells map of `topo` (NonConformingGridTopology, or the conforming
+#   topology on a never-adapted octree), which also finds the coarse neighbour across a hanging
+#   face. uₕ may live on a sub-triangulation of Ω (e.g. the narrow band): it is evaluated at the
+#   located background cells, as the serial uniform-mesh method does.
+# - cpₕ: closest points as a vector FE function (free values interleaved D per node, in the order
+#   of the scalar free dofs), from compute_closest_point_projections(model,[topo,]V,φ,order,L).
+# Returns the per-rank displacement vectors (scalar free-dof order) and the per-rank caches.
+# Several ranks would need the closest points owned by another rank to be exchanged (see the
+# upstream distributed Cartesian compute_normal_displacement); not implemented.
+function compute_normal_displacement!(
+    cache,
+    uₕ::DistributedCellField,
+    cpₕ::DistributedCellField,
+    phi::DistributedAlgoimCallLevelSetFunction,
+    dt::Float64,
+    Ω::DistributedTriangulation,
+    topo::MPIArray{<:Gridap.Geometry.GridTopology})
+  @notimplementedif length(local_views(Ω)) != 1 "Octree normal displacement: only 1 rank is implemented"
+  caches = isnothing(cache) ? map(_->nothing,local_views(Ω)) : cache
+  out = map(caches,local_views(uₕ),local_views(cpₕ),local_views(phi),local_views(Ω),topo
+           ) do c,u,cp,φ,Ωl,tp
+    sm = KDTreeSearch(vertex_to_cells=get_faces(tp,0,num_cell_dims(Ωl)))
+    compute_normal_displacement!(c,u,cp,φ,dt,Ωl;searchmethod=sm)
+  end
+  map(first,out), map(last,out)
 end
 
 @inline signed_distance(φ::AlgoimCallLevelSetFunction,x,y) = signed_distance(φ.φ,x,y)
