@@ -152,44 +152,6 @@ function get_faces(ncgt::NonConformingGridTopology{Dc,Dp,T,O},
 end
 
 # ---------------------------------------------------------------------------
-# Gridap.Adaptivity.get_model overload
-#
-# Round-trips an OctreeDistributedDiscreteModel through Gridap.Adaptivity.adapt,
-# unwrapping the resulting DistributedAdaptedDiscreteModel back into a plain
-# OctreeDistributedDiscreteModel so it can be adapted again / used with the rest
-# of the GridapP4est API.
-# ---------------------------------------------------------------------------
-
-function Gridap.Adaptivity.get_model(model::OctreeDistributedDiscreteModel)
-  dmodel = GridapDistributed.GenericDistributedDiscreteModel(
-    map(Gridap.Adaptivity.get_model,local_views(model)),
-    get_cell_gids(model)
-  )
-  # `new_model` below aliases the SAME model.ptr_pXest as `model`. Unlike
-  # ptr_pXest_connectivity (safely shared via reference-counted connectivity_ref),
-  # ptr_pXest has no such sharing: every OctreeDistributedDiscreteModel's finalizer
-  # unconditionally calls pXest_destroy on it. Two live objects wrapping the same
-  # raw pointer therefore both eventually try to destroy it -> double free ->
-  # segfault (reproduced reliably when Gridap.Adaptivity.adapt is called repeatedly
-  # in a loop, e.g. build_initial_adaptive_bgmodel's refine/coarsen loop). ptr_pXest's
-  # field type is fixed (non-Nullable) by construction, so it can't be nulled out on
-  # `model` here to relinquish ownership; instead GridapP4est.octree_distributed_discrete_model_free!
-  # itself now guards against destroying the same raw pointer twice (see
-  # OctreeDistributedDiscreteModels.jl).
-  new_model = OctreeDistributedDiscreteModel(
-    num_cell_dims(model), num_point_dims(model),
-    model.parts,dmodel,model.non_conforming_glue,
-    model.coarse_model,
-    model.ptr_pXest_connectivity,
-    model.ptr_pXest,
-    model.pXest_type,
-    model.pXest_refinement_rule_type,
-    model.connectivity_ref; num_ghost_layers = model.num_ghost_layers
-  )
-  return new_model
-end
-
-# ---------------------------------------------------------------------------
 # MyFESpace
 #
 # Builds a DistributedFESpace with linear constraints from per-rank slave-DOF
