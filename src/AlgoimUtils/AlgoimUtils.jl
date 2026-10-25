@@ -42,6 +42,7 @@ import Algoim: CachedLevelSetValue
 import Algoim: CachedLevelSetGradient
 import Algoim: AlgoimCallLevelSetFunction
 import Algoim: normal
+import Algoim as AlgoimPkg # the name `Algoim` is the quadrature type below
 import Gridap.ReferenceFEs: Quadrature
 
 export CellQuadratureAndActiveMask
@@ -126,13 +127,45 @@ function normal(ls::AlgoimCallLevelSetFunction{<:CellField,<:CellField},x::Point
   gx/norm(gx)
 end
 
+# C++ level set for the Algoim quadrature, and the Julia objects it points to (its roots).
+# Same construction as Algoim.JuliaFunctionLevelSet (Algoim.jl 0.2.4, src/Algoim.jl:108-132)
+# without its CxxWrap.gcprotect calls (src/Algoim.jl:113-115 and 126-128), which are never
+# undone: every quadrature call kept its level-set FE function, gradient and caches alive
+# (0.168 MiB/step in a deforming run). The caller keeps the roots alive with GC.@preserve
+# while the C++ level set is used, i.e. while the quadrature is computed.
+function julia_levelset_and_roots(phi::AlgoimCallLevelSetFunction,::Val{2})
+  v_wrap = @safe_cfunction(AlgoimPkg.julia_function_wrap,
+    Float64,(ConstCxxRef{AlgoimPkg.AlgoimUvector{Float64,2}},Float32,Ptr{Cvoid}))
+  g_wrap = @safe_cfunction(AlgoimPkg.julia_function_wrap,
+    ConstCxxRef{AlgoimPkg.AlgoimUvector{Float64,2}},(ConstCxxRef{AlgoimPkg.AlgoimUvector{Float64,2}},Float32,Ptr{Cvoid}))
+  f = CachedLevelSetValue(phi.φ,phi.cache_φ)
+  g = CachedLevelSetGradient(phi.∇φ,phi.cache_∇φ)
+  jls = AlgoimPkg.JuliaFunction2DLevelSet{Int32(2)}(AlgoimPkg.ClosureLevelSet{Int32(2)}(v_wrap,f),
+                                                     AlgoimPkg.ClosureLevelSet{Int32(2)}(g_wrap,g))
+  jls, (v_wrap,g_wrap,f,g)
+end
+
+function julia_levelset_and_roots(phi::AlgoimCallLevelSetFunction,::Val{3})
+  v_wrap = @safe_cfunction(AlgoimPkg.julia_function_wrap,
+    Float64,(ConstCxxRef{AlgoimPkg.AlgoimUvector{Float64,3}},Float32,Ptr{Cvoid}))
+  g_wrap = @safe_cfunction(AlgoimPkg.julia_function_wrap,
+    ConstCxxRef{AlgoimPkg.AlgoimUvector{Float64,3}},(ConstCxxRef{AlgoimPkg.AlgoimUvector{Float64,3}},Float32,Ptr{Cvoid}))
+  f = CachedLevelSetValue(phi.φ,phi.cache_φ)
+  g = CachedLevelSetGradient(phi.∇φ,phi.cache_∇φ)
+  jls = AlgoimPkg.JuliaFunction3DLevelSet{Int32(3)}(AlgoimPkg.ClosureLevelSet{Int32(3)}(v_wrap,f),
+                                                     AlgoimPkg.ClosureLevelSet{Int32(3)}(g_wrap,g))
+  jls, (v_wrap,g_wrap,f,g)
+end
+
+# The per-cell loops below are eager (map over an Enumerate returns a Vector), so the C++
+# level set is not used after GC.@preserve ends: the quadratures hold plain Julia arrays.
 function Quadrature(trian::Grid,::Algoim,phi::LevelSetFunction,degree::Int;kwargs...)
   ctype_polytope = map(get_polytope,get_reffes(trian))
   @notimplementedif !all(map(is_n_cube,ctype_polytope))
   cell_to_coords = get_cell_coordinates(trian)
   cell_to_bboxes = collect1d(lazy_map(a->(a[1],a[end]),cell_to_coords))
-  jls = JuliaFunctionLevelSet(phi,Val{num_dims(trian)}())
-  cell_to_quad = map(enumerate(cell_to_bboxes)) do (cell_id,bbox)
+  jls, roots = julia_levelset_and_roots(phi,Val{num_dims(trian)}())
+  cell_to_quad = GC.@preserve jls roots map(enumerate(cell_to_bboxes)) do (cell_id,bbox)
     bbmin, bbmax = bbox
     Quadrature(cell_id,bbmin,bbmax,jls,phi,degree;kwargs...)
   end
@@ -145,8 +178,8 @@ function Quadrature(trian::Grid,::Algoim,phi::LevelSetFunction,
   @notimplementedif !all(map(is_n_cube,ctype_polytope))
   cell_to_coords = get_cell_coordinates(trian)
   cell_to_bboxes = collect1d(lazy_map(a->(a[1],a[end]),cell_to_coords))
-  jls = JuliaFunctionLevelSet(phi,Val{num_dims(trian)}())
-  cell_to_quad = map(enumerate(cell_to_bboxes)) do (own_cell_id,bbox)
+  jls, roots = julia_levelset_and_roots(phi,Val{num_dims(trian)}())
+  cell_to_quad = GC.@preserve jls roots map(enumerate(cell_to_bboxes)) do (own_cell_id,bbox)
     bbmin, bbmax = bbox
     cell_id = own_to_local[own_cell_id]
     Quadrature(cell_id,bbmin,bbmax,jls,phi,degree;kwargs...)
@@ -161,9 +194,9 @@ function Quadrature(trian::Grid,::Algoim,
   @notimplementedif !all(map(is_n_cube,ctype_polytope))
   cell_to_coords = get_cell_coordinates(trian)
   cell_to_bboxes = collect1d(lazy_map(a->(a[1],a[end]),cell_to_coords))
-  jls1 = JuliaFunctionLevelSet(phi1,Val{num_dims(trian)}())
-  jls2 = JuliaFunctionLevelSet(phi2,Val{num_dims(trian)}())
-  cell_to_quad = map(enumerate(cell_to_bboxes)) do (cell_id,bbox)
+  jls1, roots1 = julia_levelset_and_roots(phi1,Val{num_dims(trian)}())
+  jls2, roots2 = julia_levelset_and_roots(phi2,Val{num_dims(trian)}())
+  cell_to_quad = GC.@preserve jls1 jls2 roots1 roots2 map(enumerate(cell_to_bboxes)) do (cell_id,bbox)
     bbmin, bbmax = bbox
     Quadrature(cell_id,bbmin,bbmax,jls1,jls2,phi1,phi2,degree;kwargs...)
   end
